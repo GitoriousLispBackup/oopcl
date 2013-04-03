@@ -127,8 +127,23 @@ error mode is :no-error."))
   (when (eql (lock-owner l) process)
     (error "can't seize ~a: already seized by current process." l)))
 
+(defmacro set-if (value oldval newval)
+  `(cond ((equal ,value ,oldval) (setf ,value ,newval))
+         (t nil)))
+
 (defmethod seize ((l simple-lock))
   (locked-by-current-processp l *lock-current-process*)
-  (do ()
-      ((setf (lock-owner l) *lock-current-process*))
-    (format t "should wait until lock-owner is null")))
+  ;; in a real lock, this would be a in a do that would block until
+  ;; the lock is acquired, i.e.
+
+  ;; (do ()
+  ;;     ((set-if (lock-owner l) nil *lock-current-process))
+  ;;   (process-wait "Seizing lock" #'(lambda () (null (lock-owner l)))))
+  ;;  l)
+  (set-if (lock-owner l) nil *lock-current-process*))
+
+(defmethod release ((l simple-lock) &optional (failure-mode :no-error))
+  (or (set-if (lock-owner l) *lock-current-process* nil)
+      (ecase failure-mode
+        (:no-error nil)
+        (:error (error "~a is not owned by this processes" l)))))
