@@ -62,9 +62,8 @@
 (defun make-simple-lock (name)
   (make-instance 'simple-lock :name name))
 
-(defvar *null-lock*)
-(defvar *simple-lock*)
-(setq *simple-lock* (make-simple-lock "global simple lock"))
+(defvar *null-lock*   (make-null-lock "global null lock"))
+(defvar *simple-lock* (make-simple-lock "global simple lock"))
 
 ;;;; illustrating inheritance
 (defun display-lock-inheritance ()
@@ -72,3 +71,64 @@
   (format t "type-of *simple-lock*: ~a~%" (type-of *simple-lock*))
   (format t "simple-lock is a lock? ~a~%" (typep *simple-lock* 'lock))
   (format t "simple-lock is a null-lock? ~a~%" (typep *simple-lock* 'null-lock)))
+
+;;;; generic methods
+
+;;; note that these now shape future methods: all methods based on
+;;; this generic must have congruent parameterisation.
+
+(defgeneric seize (lock)
+  (:documentation
+"Seizes the lock.
+Returns the lock when the operation successed. Some locks wait until they
+succeed, while others returns nil on failure."))
+
+(defgeneric release (lock &optional failure-mode)
+  (:documentation
+"Releases the lock if it is currently owned by this process. Returns t on
+success. If unsuccessful and failure-mode is :no-error, returns nil. If
+ unsuccessful and failure-mode is :error, signals an error. The default
+error mode is :no-error."))
+
+;;; alternatively, creating a method automatically creates the
+;;; corresponding generic.
+
+;;;; method definitions
+
+(defmethod seize ((l null-lock)) l) ; return lock, no waiting
+(defmethod release ((l null-lock) &optional failure-mode)
+  (declare (ignore failure-mode))   ; never fails for null locks
+  t)
+
+;;; lambda list declares method's scope via specialised
+;;; parameters. methods are applicable if there is parity between the
+;;; method's specialised parameters and the corresponding generic
+;;; function's argument list.
+
+
+;;;; the book's implementation of the simple lock is predicated on
+;;;; their use of some imagined multiprocess primitives. this was,
+;;;; after all, 1991. the berlin wall had fallen only a few short
+;;;; years ago, iraq was invaded, and linux was just a gleam in Linus'
+;;;; eye. okay, it was probably in some realised albeit nascent state,
+;;;; but the point is multiprocessor primitives were likely not
+;;;; common. although, the book was published by mit press and written
+;;;; by an employee of symbolics... i digress. i will fake some of the
+;;;; multiprocessor code.
+(defvar *lock-current-process* nil "place holder for current process")
+
+(defun switch-process (p)
+  (setq *lock-current-process* p))
+(defun current-process () *lock-current-process*)
+(defun current-processp (p) (equal *lock-current-process* p))
+
+;;; now we add some code for the simple-lock
+(defmethod locked-by-current-processp ((l simple-lock) process)
+  (when (eql (lock-owner l) process)
+    (error "can't seize ~a: already seized by current process." l)))
+
+(defmethod seize ((l simple-lock))
+  (locked-by-current-processp l *lock-current-process*)
+  (do ()
+      ((setf (lock-owner l) *lock-current-process*))
+    (format t "should wait until lock-owner is null")))
