@@ -119,6 +119,7 @@ error mode is :no-error."))
 
 (defun switch-process (p)
   (setq *lock-current-process* p))
+(switch-process :foo)
 (defun current-process () *lock-current-process*)
 (defun current-processp (p) (equal *lock-current-process* p))
 
@@ -147,3 +148,220 @@ error mode is :no-error."))
       (ecase failure-mode
         (:no-error nil)
         (:error (error "~a is not owned by this processes" l)))))
+
+;;; defaults can't be specified in generics, but can be in methods.
+
+;;;; overriding default print representation: CLOS specifies the
+;;;; print-object generic function. it takes the object and a stream,
+;;;; prints the object to the stream, and returns the object.
+(defmethod print-object ((l lock) stream)
+  (format stream "#<~S ~A>"
+          (type-of l)
+          (if (slot-boundp l 'name)
+              (lock-name l)
+              "(no name)")))
+
+;;; would be helpful to provide a function for describing the
+;;; object. could implement a show-lock function, the book mentions it
+;;; is better to use the CLOS-provided describe: hackers already know
+;;; it. however, modern day CLOS doesn't like this so we'll provide
+;;; show-lock.
+
+;; (defmethod describe ((l lock))
+;;   (format t "~& ~S is a lock of type ~S name ~A."
+;;           l (type-of l)
+;;           (if (slot-boundp l 'name)
+;;               (lock-name l)
+;;               "(no name)"))
+;;   (values))
+
+(defmethod show-lock ((l lock))
+  (format t "~& ~S is a lock of type ~S named ~A."
+          l (type-of l)
+          (if (slot-boundp l 'name)
+              (lock-name l)
+              "(no name)"))
+  (values))
+
+;;; after-methods allow more specialised results in the call chain.
+
+(defmethod show-lock :after ((l simple-lock))
+  (let ((owner (lock-owner l)))
+    (if owner
+        (format t "~&The lock is owned by ~A." owner)
+        (format t "~&The lock is free."))
+    owner))
+
+;;; the first show-lock is the least specific and is called on the
+;;; lock. the :after keyword tells the second show-lock to operate
+;;; after the first. without this keyword, we would only see the
+;;; second method.
+
+;;; for example, null-lock's show-lock overrides the superclass's
+;;; method.
+
+(defmethod show-lock ((l null-lock))
+  (format t "~&null lock ~A."
+          (if (slot-boundp l 'name)
+              (format nil "named ~A" (lock-name l))
+              "with no name"))
+  (values))
+
+;;; rule 1 of class precedence: a class always has higher priority
+;;; over its superclass.
+
+;;;; mixin/aggregate classes
+
+;;; order-lock-mixin is a mixin class; one that is designed to be
+;;; combined with other classes to provide enhancements to their
+;;; functionality.
+
+(defclass ordered-lock-mixin ()
+  ((level :initarg :level
+          :reader lock-level
+          :type integer))
+  (:documentation "Avoid deadlock by checking lock order."))
+
+;;; The type option hints to CLOS what the type of the slot should
+;;; be. There is no guarantee that this will be enforced.
+
+;;; two aggregate classes: classes built from multiple superclasses.
+(defclass ordered-lock (ordered-lock-mixin simple-lock)
+  ()
+  (:documentation
+"Avoids deadlock by ensuring that a process seizes locks in a specific
+order. When seizing, waits if the lock is busy."))
+
+(defclass ordered-null-lock (ordered-lock-mixin null-lock)
+  ()
+  (:documentation
+"Avoids deadlock by ensuring that a process seizes locks in a specific
+order. Does not actually seize anything, but does check that the lock
+ordering is obeyed."))
+
+;;; aggregate classes rarely include additional methods; instead those
+;;; methods are contained in the superclasses.
+(defun make-ordered-null-lock (name level)
+  (make-instance 'ordered-null-lock :name name
+                                    :level level))
+
+(defun make-ordered-lock (name level)
+  (make-instance 'ordered-lock :name name
+                               :level level))
+
+;;; rule 2 of class precedence: each class definition sets the
+;;; precedence order of its direct superclass.
+
+;;; this precedence is given in the defclass. therefore, the class
+;;; precedence of ordered-lock is:
+;;;   ordered-lock -> ordered-lock-mixin -> simple-lock lock
+;;;   standard-object -> t
+
+(defmethod show-lock :after ((l ordered-lock-mixin))
+  (format t "~&Its lock level is ~D." (lock-level l)))
+
+(defvar *ordered-lock* (make-ordered-lock "ordered lock" 3))
+
+;;;; implementing ordered lock table behaviour
+
+(defvar *process-lock-table* (make-hash-table)
+  "Each key is a process identifier; value is a list of ordered locks it owns.")
+
+;; the next three functions should have some sort of process
+;; preemption prevention.
+(defun add-process-lock (process lock)
+  (push lock (gethash process *process-lock-table*)))
+
+(defun delete-process-lock (process lock)
+  (let ((hash-entry
+         (gethash process *process-lock-table*)))
+    (setf (gethash process *process-lock-table*)
+          (delete lock hash-entry))))
+
+(defun get-process-locks (process)
+  (gethash process *process-lock-table*))
+
+;; relies on process lock list being ordered
+(defun get-highest-lock (process)
+  (first (get-process-locks process)))
+
+(defmethod seize :before ((l ordered-lock-mixin))
+  (locked-by-current-processp l *lock-current-process*)
+  (let ((highest-lock (get-highest-lock *lock-current-process*)))
+    (when (and highest-lock
+               (<= (lock-level l) (lock-level highest-lock)))
+      (error "Out of order: Can't seize ~A while owning ~A"
+             l highest-lock))))
+
+(defmethod seize :after ((l ordered-lock-mixin))
+  (add-process-lock *lock-current-process* l))
+
+(defmethod release :after ((l ordered-lock-mixin) &optional failure-mode)
+  (declare (ignore failure-mode))
+  (delete-process-lock *lock-current-process* l))
+
+;;;; example: print queue
+
+(defclass print-request-queue ()
+  ((lock :accessor print-queue-lock
+          :initform (make-simple-lock "Print Queue"))
+   (requests :accessor print-requests :initform nil)))
+
+(defun make-print-queue () (make-instance 'print-request-queue))
+(defvar *print-queue* (make-print-queue))
+
+(defun enqueue-print-request (r)
+  (let ((lock (print-queue-lock *print-queue*)))
+    (unwind-protect
+         (progn (seize lock)
+                (push r (print-requests *print-queue*)))
+      (release lock :no-error))))
+
+(defun dequeue-print-request (r)
+  (let ((lock (print-queue-lock *print-queue*)))
+    (unwind-protect
+         (progn
+           (seize lock)
+           (setf (print-requests *print-queue*)
+                 (delete r (print-requests *print-queue*))))
+      (release lock :no-error))))
+
+(defmacro with-lock ((lock) &body body)
+  (let ((lock-var (gensym)))
+    `(let ((,lock-var ,lock))
+       (unwind-protect
+            (progn (seize ,lock-var)
+                   ,@body)
+         (release ,lock-var :no-error)))))
+
+(defun enqueue-print-request% (r)
+  (with-lock ((print-queue-lock *print-queue*))
+    (push r (print-requests *print-queue*))))
+
+(defun dequeue-print-request% (r)
+  (with-lock ((print-queue-lock *print-queue*))
+    (setf (print-requests *print-queue*)
+          (delete r (print-requests *print-queue*)))))
+
+;;; don't lock queue so a processing holding up the print queue will
+;;; show up.
+(defmethod show-lock ((queue print-request-queue))
+  (let ((owner (lock-owner (print-queue-lock queue)))
+        (requests (print-requests queue)))
+    (if owner
+        (format t "~&Process ~A owns queue.~%" owner))
+    (format t (if (null requests)
+                  "~&There are no print requests.~%"
+                  "~&Pending print requests:~%"))
+    (dolist (x requests)
+      (format t "~&~A " x))))
+
+;;;; no distinction is made between private and public elements, so
+;;;; the API documentation should only describe public interfaces.
+
+;;;; guidelines on designing protocols
+;;;  - restrict user access to internal data structures.
+;;;  - provide constructors to control data going into a new instance.
+;;;  - design protocol to anticipate needs of the users.
+;;;  - allow protocol to evolve to meet the reasonable needs of users.
+;;;  - design for extensibility.
